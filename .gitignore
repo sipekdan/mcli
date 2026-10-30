@@ -1,0 +1,7 @@
+/target
+/.minecraft-cli/
+auth.json
+launcher_profiles.json
+*.part
+.env
+.env.*

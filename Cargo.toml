@@ -1,0 +1,15 @@
+[package]
+name = "mcli"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+zip = "2.2"
+dirs = "5.0"
+indicatif = "0.17"
