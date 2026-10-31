@@ -210,6 +210,15 @@ fn legacy_arguments(
     // Pre-1.13 metadata stores one placeholder-filled argument string instead
     // of the modern structured argument array.
     let args = blueprint["minecraftArguments"].as_str()?;
+
+    let assets_root = assets_dir.to_string_lossy();
+    let game_directory = game_dir.to_string_lossy();
+
+    let asset_index = blueprint["assetIndex"]["id"]
+        .as_str()
+        .or_else(|| blueprint["assets"].as_str())
+        .unwrap_or("legacy");
+
     Some(
         args.split_whitespace()
             .map(|arg| {
@@ -217,8 +226,10 @@ fn legacy_arguments(
                     .replace("${auth_uuid}", uuid)
                     .replace("${auth_session}", access_token)
                     .replace("${auth_access_token}", access_token)
-                    .replace("${game_directory}", &game_dir.to_string_lossy())
-                    .replace("${game_assets}", &assets_dir.to_string_lossy())
+                    .replace("${game_directory}", &game_directory)
+                    .replace("${game_assets}", &assets_root)
+                    .replace("${assets_root}", &assets_root)
+                    .replace("${assets_index_name}", asset_index)
                     .replace("${version_name}", version)
                     .replace("${user_type}", user_type)
                     .replace("${user_properties}", "{}")
@@ -414,6 +425,43 @@ mod tests {
                 "msa",
                 "--gameDir",
                 "game"
+            ]
+        );
+    }
+
+    #[test]
+    fn expands_minecraft_1_8_9_asset_arguments() {
+        let blueprint = json!({
+            "minecraftArguments":
+                "--username ${auth_player_name} \
+                --gameDir ${game_directory} \
+                --assetsDir ${assets_root} \
+                --assetIndex ${assets_index_name}",
+            "assets": "1.8",
+            "assetIndex": {
+                "id": "1.8"
+            }
+        });
+
+        let args = legacy_arguments(
+            &blueprint,
+            "Player",
+            "uuid",
+            "0",
+            "legacy",
+            Path::new("game"),
+            Path::new("assets"),
+            "1.8.9",
+        )
+        .unwrap();
+
+        assert_eq!(
+            args,
+            [
+                "--username", "Player",
+                "--gameDir", "game",
+                "--assetsDir", "assets",
+                "--assetIndex", "1.8",
             ]
         );
     }
