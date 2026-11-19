@@ -1,6 +1,6 @@
 [package]
 name = "mcli"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 
 [dependencies]
@@ -13,3 +13,7 @@ futures = "0.3"
 zip = "2.2"
 dirs = "5.0"
 indicatif = "0.17"
+sha1_smol = "1.0.1"
+md5 = "0.8.1"
+regex-lite = "0.1.9"
+sha2 = "0.11.1"
