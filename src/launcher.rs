@@ -1,252 +1,159 @@
 //! The launch pipeline: resolve a version, fetch its files, assemble Java
 //! arguments, and start the game process.
 
+use crate::arguments::{self, declares_feature, LaunchInputs, QuickPlay};
 use crate::assets::sync_assets;
 use crate::auth::get_auth;
 use crate::cli::ProfileOverrides;
-use crate::config::{Paths, Result, CLASSPATH_SEP, MOJANG_OS};
-use crate::http::{download_file, extract_zip};
-use crate::profile::{apply_overrides, load_profiles, save_profiles, Profile};
+use crate::config::{Paths, Result, CLASSPATH_SEP, DEFAULT_JVM_ARGS};
+use crate::files::{fetch_missing, plan_game_files, GamePlan, Kind};
+use crate::http::{extract_zip, needs_download};
+use crate::profile::{apply_loader, apply_overrides, load_profiles, save_profiles, Profile};
 use crate::runtime::ensure_java;
-use crate::version::{maven_to_path, resolve_blueprint};
-use futures::stream::{self, StreamExt};
-use indicatif::{ProgressBar, ProgressStyle};
+use crate::version::{resolve_alias, resolve_blueprint};
 use reqwest::Client;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Instant;
 
+pub struct RunOptions {
+    pub offline: bool,
+    pub server: Option<String>,
+    pub port: String,
+    pub world: Option<String>,
+    pub dry_run: bool,
+    pub detach: bool,
+}
+
+pub struct GameFiles {
+    pub classpath: String,
+    pub natives_dir: PathBuf,
+    pub game_assets: PathBuf,
+    pub log_argument: Option<String>,
+}
+
+/// Give a child version its own client jar (see `files::plan_game_files`).
+/// A hard link costs no disk space; fall back to copying across devices.
+fn link_launch_jar(plan: &GamePlan) -> Result<()> {
+    if plan.launch_jar == plan.parent_jar || !needs_download(&plan.launch_jar, None) {
+        return Ok(());
+    }
+    if let Some(dir) = plan.launch_jar.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    if fs::hard_link(&plan.parent_jar, &plan.launch_jar).is_err() {
+        fs::copy(&plan.parent_jar, &plan.launch_jar)?;
+    }
+    Ok(())
+}
+
+/// Download whatever is missing or the wrong size, extract natives, and
+/// return what the launch needs.
 pub async fn download_game_files(
     client: &Client,
     paths: &Paths,
     blueprint: &Value,
     game_dir: Option<&Path>,
-    fast: bool,
-) -> Result<(String, PathBuf, PathBuf)> {
-    // `_jar_version` is the base version that owns the client JAR. A modded
-    // child profile may have a different visible version ID.
-    let jar_version = blueprint["_jar_version"].as_str().unwrap();
-    let client_jar_path = paths
-        .versions
-        .join(jar_version)
-        .join(format!("{}.jar", jar_version));
+) -> Result<GameFiles> {
+    let plan = plan_game_files(paths, blueprint)?;
+    fetch_missing(client, &plan.files, "libraries").await?;
+    link_launch_jar(&plan)?;
 
-    if let Some(url) = blueprint["downloads"]["client"]["url"].as_str() {
-        download_file(client, url, &client_jar_path, true).await?;
+    // Pre-1.19 natives come as archives. Re-extracting the few small files
+    // each launch keeps the directory in sync with the verified archives.
+    for entry in plan.files.iter().filter(|e| e.kind == Kind::Native) {
+        extract_zip(&entry.path, &plan.natives_dir, true)?;
     }
 
-    let natives_dir = paths
-        .versions
-        .join(jar_version)
-        .join(format!("natives-{}", MOJANG_OS));
-    let mut classpath_jars: Vec<String> = Vec::new();
-    let mut seen_paths: HashSet<String> = HashSet::new();
-    let mut seen_artifacts: HashSet<String> = HashSet::new();
-    // `(URL, destination, is_native_archive)`. Build this list first so
-    // independent library downloads can run concurrently below.
-    let mut downloads: Vec<(String, PathBuf, bool)> = Vec::new();
-    let mut scheduled_paths: HashSet<PathBuf> = HashSet::new();
+    let mut classpath: Vec<String> = plan
+        .classpath
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    classpath.push(plan.launch_jar.to_string_lossy().into_owned());
 
-    println!("[!] Processing libraries and natives...");
-    if let Some(libs) = blueprint["libraries"].as_array() {
-        for lib in libs {
-            // Mojang metadata can include libraries for a different OS.
-            if let Some(rules) = lib["rules"].as_array() {
-                let mut allowed = false;
-                for rule in rules {
-                    let action = rule["action"].as_str().unwrap_or("");
-                    let rule_os = rule["os"]["name"].as_str();
-                    if action == "allow" && (rule_os == Some(MOJANG_OS) || rule_os.is_none()) {
-                        allowed = true;
-                    } else if action == "disallow" && rule_os == Some(MOJANG_OS) {
-                        allowed = false;
-                    }
-                }
-                if !allowed {
-                    continue;
-                }
-            }
-
-            // A child version may repeat a parent's Maven artifact. Keep the
-            // first matching coordinate in the classpath.
-            if let Some(coord) = lib["name"].as_str() {
-                let parts: Vec<&str> = coord.split(':').collect();
-                if parts.len() >= 2 && lib.get("natives").is_none() {
-                    let classifier = parts.get(3).copied().unwrap_or("");
-                    let key = format!("{}:{}:{}", parts[0], parts[1], classifier);
-                    if !seen_artifacts.insert(key) {
-                        continue;
-                    }
-                }
-            }
-
-            // Modern metadata gives an exact artifact URL. Older metadata has
-            // no `downloads` object, so derive its Maven repository path.
-            if let Some(artifact) = lib.get("downloads").and_then(|d| d.get("artifact")) {
-                if let (Some(url), Some(p)) = (artifact["url"].as_str(), artifact["path"].as_str())
-                {
-                    crate::config::validate_relative_path(p)?;
-                    let lib_path = paths.libraries.join(p);
-                    let s = lib_path.to_string_lossy().to_string();
-                    if seen_paths.insert(s.clone()) {
-                        classpath_jars.push(s);
-                    }
-                    if scheduled_paths.insert(lib_path.clone()) && !lib_path.exists() {
-                        downloads.push((url.to_string(), lib_path, false));
-                    }
-                }
-            } else if lib.get("downloads").is_none() {
-                let Some(name) = lib["name"].as_str() else {
-                    continue;
-                };
-                let rel_path = maven_to_path(name)
-                    .ok_or_else(|| format!("Invalid Maven library coordinate: '{name}'"))?;
-                crate::config::validate_relative_path(&rel_path)?;
-                let mut base_url = lib["url"]
-                    .as_str()
-                    .unwrap_or("https://libraries.minecraft.net/")
-                    .to_string();
-                if !base_url.ends_with('/') {
-                    base_url.push('/');
-                }
-                let lib_path = paths.libraries.join(&rel_path);
-                let s = lib_path.to_string_lossy().to_string();
-                if seen_paths.insert(s.clone()) {
-                    classpath_jars.push(s);
-                }
-                if scheduled_paths.insert(lib_path.clone()) && !lib_path.exists() {
-                    downloads.push((base_url + &rel_path, lib_path, false));
-                }
-            }
-
-            // Native classifier names can include `${arch}`. Download and
-            // extract the platform-specific archive separately from classpath jars.
-            if let Some(nat_tmpl) = lib.get("natives").and_then(|n| n[MOJANG_OS].as_str()) {
-                let arch_bits = if cfg!(target_pointer_width = "32") {
-                    "32"
-                } else {
-                    "64"
-                };
-                let key = nat_tmpl.replace("${arch}", arch_bits);
-                if let Some(nat_info) = lib
-                    .get("downloads")
-                    .and_then(|d| d.get("classifiers"))
-                    .and_then(|c| c.get(&key))
-                {
-                    if let (Some(url), Some(p)) =
-                        (nat_info["url"].as_str(), nat_info["path"].as_str())
-                    {
-                        crate::config::validate_relative_path(p)?;
-                        let nat_jar = paths.libraries.join(p);
-                        if scheduled_paths.insert(nat_jar.clone()) {
-                            if nat_jar.exists() {
-                                extract_zip(&nat_jar, &natives_dir, true)?;
-                            } else {
-                                downloads.push((url.to_string(), nat_jar, true));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if !downloads.is_empty() {
-        println!("Downloading {} libraries...", downloads.len());
-        let progress = ProgressBar::new(downloads.len() as u64);
-        progress.set_style(ProgressStyle::with_template(
-            "  {spinner:.green} {wide_bar:.green/white} {pos}/{len} • {eta}",
-        )?);
-        progress.enable_steady_tick(std::time::Duration::from_millis(100));
-
-        // Downloading libraries is network-bound; cap concurrency just as with
-        // assets while keeping extraction itself serialized.
-        let mut stream = stream::iter(downloads)
-            .map(|(url, path, is_native)| {
-                let client = client.clone();
-                async move {
-                    download_file(&client, &url, &path, true).await?;
-                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((path, is_native))
-                }
-            })
-            .buffer_unordered(16);
-
-        while let Some(result) = stream.next().await {
-            let (path, is_native) = result?;
-            if is_native {
-                extract_zip(&path, &natives_dir, true)?;
-            }
-            progress.inc(1);
-        }
-        progress.finish_with_message("libraries ready");
-    }
-
-    let client_str = client_jar_path.to_string_lossy().to_string();
-    if seen_paths.insert(client_str.clone()) {
-        classpath_jars.push(client_str);
-    }
-
-    let active_assets = sync_assets(client, paths, blueprint, game_dir, fast).await?;
-    Ok((
-        classpath_jars.join(CLASSPATH_SEP),
-        natives_dir,
-        active_assets,
-    ))
+    let game_assets = sync_assets(client, paths, blueprint, game_dir).await?;
+    Ok(GameFiles {
+        classpath: classpath.join(CLASSPATH_SEP),
+        natives_dir: plan.natives_dir,
+        game_assets,
+        log_argument: plan.log_argument,
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn legacy_arguments(
+/// The UUID vanilla Minecraft derives for offline players:
+/// a version-3 UUID of `OfflinePlayer:<name>`.
+pub fn offline_uuid(username: &str) -> String {
+    let mut bytes = md5::compute(format!("OfflinePlayer:{username}")).0;
+    bytes[6] = (bytes[6] & 0x0f) | 0x30;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Split `host:port` (or bare `host` + the separate `--port`).
+fn server_address(server: &str, port: &str) -> (String, String) {
+    match server.rsplit_once(':') {
+        Some((host, p)) if !host.contains(':') && p.parse::<u16>().is_ok() => {
+            (host.to_string(), p.to_string())
+        }
+        _ => (server.to_string(), port.to_string()),
+    }
+}
+
+/// JVM options chosen by the user, or the version's recommended defaults
+/// when the profile still uses mcli's stock arguments.
+fn user_jvm_args(
+    profile_args: &str,
     blueprint: &Value,
-    username: &str,
-    uuid: &str,
-    access_token: &str,
-    user_type: &str,
-    game_dir: &Path,
-    assets_dir: &Path,
-    version: &str,
-) -> Option<Vec<String>> {
-    // Pre-1.13 metadata stores one placeholder-filled argument string instead
-    // of the modern structured argument array.
-    let args = blueprint["minecraftArguments"].as_str()?;
+    inputs: &LaunchInputs,
+) -> Result<Vec<String>> {
+    if profile_args.trim() == DEFAULT_JVM_ARGS.trim() {
+        if let Some(defaults) = blueprint["arguments"].get("default-user-jvm") {
+            let mut missing = BTreeSet::new();
+            let mut args = arguments::collect(
+                defaults,
+                &inputs.placeholder_values(),
+                &inputs.features(),
+                &mut missing,
+            );
+            arguments::check_missing(&missing)?;
+            args.extend(
+                [
+                    "-Dfile.encoding=UTF-8",
+                    "-Dsun.stdout.encoding=UTF-8",
+                    "-Dsun.stderr.encoding=UTF-8",
+                ]
+                .map(String::from),
+            );
+            return Ok(args);
+        }
+    }
+    Ok(profile_args.split_whitespace().map(String::from).collect())
+}
 
-    let assets_root = assets_dir.to_string_lossy();
-    let game_directory = game_dir.to_string_lossy();
-
-    let asset_index = blueprint["assetIndex"]["id"]
-        .as_str()
-        .or_else(|| blueprint["assets"].as_str())
-        .unwrap_or("legacy");
-
-    Some(
-        args.split_whitespace()
-            .map(|arg| {
-                arg.replace("${auth_player_name}", username)
-                    .replace("${auth_uuid}", uuid)
-                    .replace("${auth_session}", access_token)
-                    .replace("${auth_access_token}", access_token)
-                    .replace("${game_directory}", &game_directory)
-                    .replace("${game_assets}", &assets_root)
-                    .replace("${assets_root}", &assets_root)
-                    .replace("${assets_index_name}", asset_index)
-                    .replace("${version_name}", version)
-                    .replace("${user_type}", user_type)
-                    .replace("${user_properties}", "{}")
-            })
-            .collect(),
-    )
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=+,@%".contains(c))
+    {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
 }
 
 pub async fn run_game(
     target: String,
     overrides: ProfileOverrides,
-    offline: bool,
-    server: Option<String>,
-    port: String,
+    options: RunOptions,
     client: &Client,
     paths: &Paths,
 ) -> Result<()> {
+    let started = Instant::now();
     crate::config::validate_id(&target)?;
     // A new target is treated as both its profile name and its version unless
     // `--version` explicitly says otherwise.
@@ -259,8 +166,9 @@ pub async fn run_game(
         .unwrap_or_else(|| Profile::new(paths, &target, overrides.version.as_deref()));
 
     apply_overrides(&mut current_profile, &overrides);
+    apply_loader(client, paths, &mut current_profile, &overrides).await?;
 
-    let target_version = current_profile.version.clone();
+    let target_version = resolve_alias(client, paths, &current_profile.version).await?;
     let bp = resolve_blueprint(client, paths, &target_version).await?;
 
     if is_new {
@@ -268,27 +176,31 @@ pub async fn run_game(
         save_profiles(paths, &profiles)?;
     }
 
-    let jar_version = bp["_jar_version"].as_str().unwrap_or(&target_version);
-
-    let auth = if offline {
+    let auth = if options.offline {
         None
     } else {
-        Some(get_auth(client, paths, overrides.account.as_deref()).await
-            .ok_or("No valid Minecraft session. Run 'mcli account login', or use --offline for offline play.")?)
+        let account = overrides.account.as_deref();
+        Some(get_auth(client, paths, account).await.ok_or_else(|| {
+            let who = account.map(|a| format!(" for account '{a}'")).unwrap_or_default();
+            format!("No valid Minecraft session{who}. Run 'mcli account login', or use --offline for offline play.")
+        })?)
     };
     let username = auth
         .as_ref()
-        .map(|a| &a.username)
-        .unwrap_or(&current_profile.username);
-    let uuid = auth
-        .as_ref()
-        .map(|a| &a.uuid)
-        .unwrap_or(&current_profile.uuid);
+        .map(|a| a.username.clone())
+        .unwrap_or_else(|| current_profile.username.clone());
+    let uuid = match &auth {
+        Some(a) => a.uuid.clone(),
+        None if current_profile.uuid.is_empty() || current_profile.uuid == "0" => {
+            offline_uuid(&username)
+        }
+        None => current_profile.uuid.clone(),
+    };
     let access_token = auth
         .as_ref()
-        .map(|a| a.access_token.as_str())
-        .unwrap_or("0");
-    let user_type = if offline { "legacy" } else { "msa" };
+        .map(|a| a.access_token.clone())
+        .unwrap_or_else(|| "0".to_string());
+    let user_type = if options.offline { "legacy" } else { "msa" };
 
     println!("=== mcli Launcher ===");
     println!(
@@ -296,96 +208,162 @@ pub async fn run_game(
         target,
         target_version,
         username,
-        if offline { "Offline" } else { "Online" }
+        if options.offline { "Offline" } else { "Online" }
     );
 
     let game_dir = PathBuf::from(&current_profile.game_dir);
     fs::create_dir_all(&game_dir)?;
 
-    let use_fast = current_profile.fast_launch || overrides.fast;
-    let (classpath_str, natives_dir, active_assets) =
-        download_game_files(client, paths, &bp, Some(&game_dir), use_fast).await?;
+    let game_files = download_game_files(client, paths, &bp, Some(&game_dir)).await?;
+    fs::create_dir_all(&game_files.natives_dir)?;
     let java_exe = ensure_java(client, paths, &bp, Some(&current_profile.java_bin)).await?;
+
+    let fullscreen = current_profile.fullscreen;
+    let resolution = (!fullscreen
+        && current_profile.width != "auto"
+        && current_profile.height != "auto")
+        .then(|| {
+            (
+                current_profile.width.clone(),
+                current_profile.height.clone(),
+            )
+        });
+
+    // Prefer the version's own quick-play arguments (1.20+); older versions
+    // only understand the legacy `--server`/`--port` pair.
+    let mut extra_game_args: Vec<String> = Vec::new();
+    let quick_play = if let Some(world) = &options.world {
+        if !declares_feature(&bp, "is_quick_play_singleplayer") {
+            return Err(format!(
+                "--world needs Minecraft 1.20 or newer ({target_version} has no quick play)"
+            )
+            .into());
+        }
+        Some(QuickPlay::Singleplayer(world.clone()))
+    } else if let Some(server) = &options.server {
+        let (host, port) = server_address(server, &options.port);
+        if declares_feature(&bp, "is_quick_play_multiplayer") {
+            Some(QuickPlay::Multiplayer(format!("{host}:{port}")))
+        } else {
+            extra_game_args.extend(["--server".into(), host, "--port".into(), port]);
+            None
+        }
+    } else {
+        None
+    };
+    if let Some((w, h)) = &resolution {
+        if !declares_feature(&bp, "has_custom_resolution") {
+            extra_game_args.extend(["--width".into(), w.clone(), "--height".into(), h.clone()]);
+        }
+    }
+    if fullscreen {
+        extra_game_args.push("--fullscreen".into());
+    }
+
+    let asset_index = bp["assetIndex"]["id"]
+        .as_str()
+        .or_else(|| bp["assets"].as_str())
+        .unwrap_or("legacy")
+        .to_string();
+    let inputs = LaunchInputs {
+        username: username.clone(),
+        uuid,
+        access_token: access_token.clone(),
+        user_type: user_type.to_string(),
+        // Only used for telemetry by the game; mcli deliberately sends none.
+        xuid: "0".to_string(),
+        client_id: "0".to_string(),
+        version_name: target_version.clone(),
+        version_type: bp["type"].as_str().unwrap_or("release").to_string(),
+        game_dir: game_dir.clone(),
+        assets_root: paths.assets.clone(),
+        game_assets: game_files.game_assets,
+        asset_index,
+        natives_dir: game_files.natives_dir,
+        library_dir: paths.libraries.clone(),
+        classpath: game_files.classpath,
+        resolution,
+        quick_play,
+        demo: false,
+    };
+    let launch_args = arguments::build(&bp, &inputs)?;
 
     // Construct the Java command only after all downloadable prerequisites are
     // present. This avoids leaving a child process running after a failed sync.
+    let mut all_args: Vec<String> = user_jvm_args(&current_profile.jvm_args, &bp, &inputs)?;
+
+    // Mojang's log4j configuration (includes security fixes for old versions).
+    all_args.extend(game_files.log_argument);
+
+    all_args.extend(launch_args.jvm);
+    all_args.push(
+        bp["mainClass"]
+            .as_str()
+            .ok_or("Version metadata has no mainClass")?
+            .to_string(),
+    );
+    all_args.extend(launch_args.game);
+    all_args.extend(extra_game_args);
+
+    if options.dry_run {
+        let shown: Vec<String> = std::iter::once(java_exe.as_str())
+            .chain(all_args.iter().map(String::as_str))
+            .map(|a| {
+                if a == access_token && access_token != "0" {
+                    "<access-token>".to_string()
+                } else {
+                    shell_quote(a)
+                }
+            })
+            .collect();
+        println!("\n# working directory: {}", game_dir.display());
+        println!("{}", shown.join(" "));
+        return Ok(());
+    }
+
     let mut cmd = Command::new(&java_exe);
-    for flag in current_profile.jvm_args.split_whitespace() {
-        cmd.arg(flag);
-    }
+    cmd.args(&all_args).current_dir(&game_dir);
 
-    // Mojang supplies logging configurations (including security fixes) for
-    // older releases. Apply them instead of relying on the configuration in the JAR.
-    if let Some(logging) = bp.get("logging").and_then(|l| l.get("client")) {
-        if let (Some(id), Some(url), Some(argument)) = (
-            logging["file"]["id"].as_str(),
-            logging["file"]["url"].as_str(),
-            logging["argument"].as_str(),
-        ) {
-            crate::config::validate_id(id)?;
-            let logging_path = paths.assets.join("log_configs").join(id);
-            download_file(client, url, &logging_path, true).await?;
-            cmd.arg(argument.replace("${path}", &logging_path.to_string_lossy()));
+    println!(
+        "\n[!] Launching Minecraft {} (ready in {:.2}s)...",
+        target_version,
+        started.elapsed().as_secs_f64()
+    );
+
+    if options.detach {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            // Own process group: closing the terminal or Ctrl+C won't kill the game.
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    cmd.arg("-XstartOnFirstThread");
-
-    cmd.arg(format!("-Djava.library.path={}", natives_dir.display()))
-        .arg("-cp")
-        .arg(&classpath_str)
-        .arg(
-            bp["mainClass"]
-                .as_str()
-                .unwrap_or("net.minecraft.client.main.Main"),
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        }
+        let child = cmd.spawn()?;
+        println!(
+            "[+] Started (pid {}). Logs: {}",
+            child.id(),
+            game_dir.join("logs").join("latest.log").display()
         );
-
-    // Pick the metadata format appropriate for the requested game version.
-    if let Some(args) = legacy_arguments(
-        &bp,
-        username,
-        uuid,
-        access_token,
-        user_type,
-        &game_dir,
-        &active_assets,
-        &target_version,
-    ) {
-        cmd.args(args);
-    } else {
-        cmd.args(["--username", username])
-            .args(["--version", &target_version])
-            .args(["--gameDir", &game_dir.to_string_lossy()])
-            .args(["--assetsDir", &active_assets.to_string_lossy()])
-            .args([
-                "--assetIndex",
-                bp["assetIndex"]["id"].as_str().unwrap_or(jar_version),
-            ])
-            .args(["--uuid", uuid])
-            .args(["--accessToken", access_token])
-            .args(["--userType", user_type]);
+        return Ok(());
     }
 
-    if current_profile.fullscreen || overrides.fullscreen {
-        cmd.arg("--fullscreen");
-    } else if current_profile.width != "auto" && current_profile.height != "auto" {
-        cmd.args([
-            "--width",
-            &current_profile.width,
-            "--height",
-            &current_profile.height,
-        ]);
-    }
-
-    if let Some(srv) = server {
-        cmd.args(["--server", &srv, "--port", &port]);
-    }
-
-    println!("\n[!] Launching Minecraft {}...", target_version);
-    let status = cmd.current_dir(&game_dir).spawn()?.wait()?;
+    let status = cmd.spawn()?.wait()?;
     if !status.success() {
-        return Err(format!("Minecraft exited with {status}").into());
+        return Err(format!(
+            "Minecraft exited with {status}. Check {} for details.\n\
+             If it crashed on startup, damaged game files are a common cause: mcli verify {target}",
+            game_dir.join("logs").join("latest.log").display()
+        )
+        .into());
     }
     println!("\n[!] Game closed.");
     Ok(())
@@ -393,76 +371,38 @@ pub async fn run_game(
 
 #[cfg(test)]
 mod tests {
-    use super::legacy_arguments;
-    use serde_json::json;
-    use std::path::Path;
+    use super::*;
 
     #[test]
-    fn expands_legacy_launcher_placeholders() {
-        let blueprint = json!({
-            "minecraftArguments": "--username ${auth_player_name} --token ${auth_access_token} --type ${user_type} --gameDir ${game_directory}"
-        });
-        let args = legacy_arguments(
-            &blueprint,
-            "Alex",
-            "uuid",
-            "token",
-            "msa",
-            Path::new("game"),
-            Path::new("assets"),
-            "1.0",
-        )
-        .unwrap();
+    fn offline_uuid_matches_vanilla() {
+        // Java: UUID.nameUUIDFromBytes("OfflinePlayer:Notch".getBytes(UTF_8))
+        assert_eq!(offline_uuid("Notch"), "b50ad385829d3141a2167e7d7539ba7f");
+    }
 
+    #[test]
+    fn parses_server_addresses() {
         assert_eq!(
-            args,
-            [
-                "--username",
-                "Alex",
-                "--token",
-                "token",
-                "--type",
-                "msa",
-                "--gameDir",
-                "game"
-            ]
+            server_address("example.org", "25565"),
+            ("example.org".into(), "25565".into())
+        );
+        assert_eq!(
+            server_address("example.org:1234", "25565"),
+            ("example.org".into(), "1234".into())
+        );
+        // A bare IPv6 address is not mistaken for host:port.
+        assert_eq!(
+            server_address("::1", "25565"),
+            ("::1".into(), "25565".into())
         );
     }
 
     #[test]
-    fn expands_minecraft_1_8_9_asset_arguments() {
-        let blueprint = json!({
-            "minecraftArguments":
-                "--username ${auth_player_name} \
-                --gameDir ${game_directory} \
-                --assetsDir ${assets_root} \
-                --assetIndex ${assets_index_name}",
-            "assets": "1.8",
-            "assetIndex": {
-                "id": "1.8"
-            }
-        });
-
-        let args = legacy_arguments(
-            &blueprint,
-            "Player",
-            "uuid",
-            "0",
-            "legacy",
-            Path::new("game"),
-            Path::new("assets"),
-            "1.8.9",
-        )
-        .unwrap();
-
+    fn quotes_only_when_needed() {
+        assert_eq!(shell_quote("-Xmx2G"), "-Xmx2G");
         assert_eq!(
-            args,
-            [
-                "--username", "Player",
-                "--gameDir", "game",
-                "--assetsDir", "assets",
-                "--assetIndex", "1.8",
-            ]
+            shell_quote("-DFabricMcEmu= net.minecraft.client.main.Main "),
+            "'-DFabricMcEmu= net.minecraft.client.main.Main '"
         );
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
     }
 }
