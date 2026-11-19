@@ -2,6 +2,7 @@
 /.minecraft-cli/
 auth.json
 launcher_profiles.json
+profiles.json
 *.part
 .env
 .env.*
