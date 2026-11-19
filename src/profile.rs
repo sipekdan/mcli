@@ -2,8 +2,12 @@
 
 use crate::cli::{ProfileAction, ProfileOverrides};
 use crate::config::{Paths, Result, DEFAULT_JVM_ARGS};
+use crate::loader;
+use crate::version::{base_game_version, resolve_alias};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
@@ -15,7 +19,6 @@ pub struct Profile {
     pub width: String,
     pub height: String,
     pub fullscreen: bool,
-    pub fast_launch: bool,
     pub java_bin: String,
     pub jvm_args: String,
     pub username: String,
@@ -30,7 +33,6 @@ impl Default for Profile {
             width: "auto".to_string(),
             height: "auto".to_string(),
             fullscreen: false,
-            fast_launch: false,
             java_bin: "bundled".to_string(),
             jvm_args: DEFAULT_JVM_ARGS.to_string(),
             username: "Player".to_string(),
@@ -49,7 +51,33 @@ impl Profile {
     }
 }
 
+/// Move profiles saved by mcli < 1.1 out of `launcher_profiles.json`, a name
+/// that mod-loader installers expect to belong to the official launcher.
+pub fn migrate_legacy_profiles(paths: &Paths) -> Result<()> {
+    let legacy = &paths.legacy_profiles_file;
+    if paths.profiles_file.exists() || !legacy.exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(legacy)?;
+    let value: Value = serde_json::from_str(&content)?;
+    // An official-launcher file has `profiles: { id: { lastVersionId, ... } }`;
+    // mcli's own entries always carry a `version` field.
+    let official = value
+        .get("profiles")
+        .and_then(Value::as_object)
+        .is_some_and(|p| p.values().all(|v| v.get("version").is_none()));
+    if official {
+        return Ok(());
+    }
+    fs::write(&paths.profiles_file, &content)?;
+    fs::remove_file(legacy)?;
+    Ok(())
+}
+
 pub fn load_profiles(paths: &Paths) -> HashMap<String, Profile> {
+    if let Err(error) = migrate_legacy_profiles(paths) {
+        eprintln!("[!] Could not migrate old profile file: {error}");
+    }
     // Invalid or absent configuration behaves like an empty profile list so a
     // user can still launch a version and recreate their settings.
     if paths.profiles_file.exists() {
@@ -95,22 +123,14 @@ pub fn apply_overrides(prof: &mut Profile, ov: &ProfileOverrides) {
     if ov.fullscreen {
         prof.fullscreen = true;
     }
-    if ov.fast {
-        prof.fast_launch = true;
+    if ov.no_fullscreen {
+        prof.fullscreen = false;
     }
     if let Some(j) = &ov.java_bin {
         prof.java_bin = j.clone();
     }
     if let Some(ja) = &ov.jvm_args {
         prof.jvm_args = ja.clone();
-    }
-    if let Some(ram) = &ov.ram {
-        let filtered: Vec<&str> = prof
-            .jvm_args
-            .split_whitespace()
-            .filter(|t| !t.starts_with("-Xmx") && !t.starts_with("-Xms"))
-            .collect();
-        prof.jvm_args = format!("-Xms{} -Xmx{} {}", ram, ram, filtered.join(" "));
     }
     if let Some(u) = &ov.username {
         prof.username = u.clone();
@@ -120,7 +140,90 @@ pub fn apply_overrides(prof: &mut Profile, ov: &ProfileOverrides) {
     }
 }
 
-pub fn handle_profile_cmd(action: ProfileAction, paths: &Paths) -> Result<()> {
+/// One `profile list` row: name, version, max heap, window, directory.
+fn list_row(paths: &Paths, name: &str, p: &Profile) -> [String; 5] {
+    let memory = if p.jvm_args.trim() == DEFAULT_JVM_ARGS.trim() {
+        "default".to_string()
+    } else {
+        p.jvm_args
+            .split_whitespace()
+            .filter_map(|a| a.strip_prefix("-Xmx"))
+            .next_back()
+            .unwrap_or("java default")
+            .to_string()
+    };
+    let window = if p.fullscreen {
+        "fullscreen".to_string()
+    } else if p.width == "auto" || p.height == "auto" {
+        "auto".to_string()
+    } else {
+        format!("{}x{}", p.width, p.height)
+    };
+    let dir = PathBuf::from(&p.game_dir);
+    let directory = if dir == paths.profiles.join(name) {
+        // The managed location; no need to repeat the long path.
+        "(managed)".to_string()
+    } else {
+        match dirs::home_dir().and_then(|home| dir.strip_prefix(home).ok().map(PathBuf::from)) {
+            Some(rel) => format!("~/{}", rel.display()),
+            None => p.game_dir.clone(),
+        }
+    };
+    [
+        name.to_string(),
+        p.version.clone(),
+        memory,
+        window,
+        directory,
+    ]
+}
+
+/// Print rows as columns sized to their widest cell.
+fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
+    let mut widths = header.map(|h| h.chars().count());
+    for row in rows {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(cell.chars().count());
+        }
+    }
+    let line = |cells: Vec<&str>| {
+        let parts: Vec<String> = cells
+            .iter()
+            .zip(widths)
+            .map(|(c, w)| format!("{c:<w$}"))
+            .collect();
+        println!("{}", parts.join("  ").trim_end());
+    };
+    line(header.to_vec());
+    for row in rows {
+        line(row.iter().map(String::as_str).collect());
+    }
+}
+
+/// Apply `--loader` / `--loader-version`, installing the loader if needed.
+/// The profile then simply stores the resulting version id.
+pub async fn apply_loader(
+    client: &Client,
+    paths: &Paths,
+    prof: &mut Profile,
+    ov: &ProfileOverrides,
+) -> Result<()> {
+    let Some(loader) = ov.loader else {
+        if ov.loader_version.is_some() {
+            return Err("--loader-version requires --loader".into());
+        }
+        return Ok(());
+    };
+    let mc = resolve_alias(client, paths, &base_game_version(paths, &prof.version)).await?;
+    prof.version = loader::ensure(client, paths, loader, &mc, ov.loader_version.as_deref()).await?;
+    Ok(())
+}
+
+pub async fn handle_profile_cmd(
+    action: ProfileAction,
+    client: &Client,
+    paths: &Paths,
+) -> Result<()> {
     let mut profiles = load_profiles(paths);
     match action {
         ProfileAction::List => {
@@ -128,26 +231,40 @@ pub fn handle_profile_cmd(action: ProfileAction, paths: &Paths) -> Result<()> {
             if profiles.is_empty() {
                 println!("No profiles created yet.");
             }
-            for (name, p) in &profiles {
-                let res = if p.width == "auto" || p.height == "auto" {
-                    "auto".to_string()
-                } else {
-                    format!("{}x{}", p.width, p.height)
-                };
-                println!(
-                    "- {:15} | Ver: {:25} | Res: {:10} | Dir: {}",
-                    name, p.version, res, p.game_dir
-                );
-            }
+            let sorted: BTreeMap<_, _> = profiles.iter().collect();
+            let rows: Vec<[String; 5]> = sorted
+                .into_iter()
+                .map(|(name, p)| list_row(paths, name, p))
+                .collect();
+            print_table(["NAME", "VERSION", "MEMORY", "WINDOW", "DIRECTORY"], &rows);
+        }
+        ProfileAction::Create { name, .. } if profiles.contains_key(&name) => {
+            return Err(format!(
+                "Profile '{name}' already exists. Use 'mcli profile edit {name} ...' to change it."
+            )
+            .into());
+        }
+        ProfileAction::Edit { name, .. } if !profiles.contains_key(&name) => {
+            return Err(format!(
+                "Profile '{name}' does not exist. Create it with 'mcli profile create'."
+            )
+            .into());
         }
         ProfileAction::Create { name, overrides } | ProfileAction::Edit { name, overrides } => {
             crate::config::validate_id(&name)?;
-            let entry = profiles
-                .entry(name.clone())
-                .or_insert_with(|| Profile::new(paths, &name, overrides.version.as_deref()));
-            apply_overrides(entry, &overrides);
+            let mut entry = profiles
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| Profile::new(paths, &name, overrides.version.as_deref()));
+            apply_overrides(&mut entry, &overrides);
+            apply_loader(client, paths, &mut entry, &overrides).await?;
+            let version = entry.version.clone();
+            profiles.insert(name.clone(), entry);
             save_profiles(paths, &profiles)?;
-            println!("[+] Profile '{}' saved successfully.", name);
+            println!(
+                "[+] Profile '{}' saved successfully (version {version}).",
+                name
+            );
         }
         ProfileAction::Rename { name, new_name } => {
             crate::config::validate_id(&new_name)?;

@@ -3,6 +3,7 @@
 //! This module intentionally only describes user input. Command behavior lives in
 //! the matching `profile`, `version`, `auth`, and `launcher` modules.
 
+use crate::loader::Loader;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
@@ -21,10 +22,23 @@ pub enum Commands {
         overrides: ProfileOverrides,
         #[arg(long, help = "Force offline mode even if logged in")]
         offline: bool,
-        #[arg(long, help = "Auto-connect to server IP")]
+        #[arg(long, help = "Auto-connect to server IP (host or host:port)")]
         server: Option<String>,
         #[arg(long, default_value = "25565", help = "Server port")]
         port: String,
+        #[arg(
+            long,
+            conflicts_with = "server",
+            help = "Jump straight into a singleplayer world (1.20+)"
+        )]
+        world: Option<String>,
+        #[arg(
+            long,
+            help = "Prepare everything and print the Java command instead of launching"
+        )]
+        dry_run: bool,
+        #[arg(short, long, help = "Return to the shell right after the game starts")]
+        detach: bool,
     },
     /// Manage profiles (list, create, edit, rename, remove)
     Profile {
@@ -40,6 +54,11 @@ pub enum Commands {
     Account {
         #[command(subcommand)]
         action: AccountAction,
+    },
+    /// Re-hash a profile's (or version's) files against official checksums and repair damaged ones
+    Verify {
+        /// Profile name or version id
+        target: String,
     },
     /// Shortcut to download the official server.jar for a version
     Server {
@@ -85,7 +104,26 @@ pub enum VersionAction {
         local: bool,
     },
     /// Download a version's files and Java runtime without launching
-    Install { version: String },
+    Install {
+        /// Minecraft version (or `latest` / `snapshot`)
+        version: String,
+        #[arg(long, value_enum, help = "Also install a mod loader")]
+        loader: Option<Loader>,
+        #[arg(
+            long,
+            requires = "loader",
+            help = "Specific loader version (default: recommended/latest stable)"
+        )]
+        loader_version: Option<String>,
+    },
+    /// List available mod-loader versions for a Minecraft version
+    Loaders {
+        #[arg(value_enum)]
+        loader: Loader,
+        version: String,
+        #[arg(long, help = "Include unstable builds and show every version")]
+        all: bool,
+    },
     /// Remove a locally installed version to free disk space
     Uninstall { version: String },
     /// Download the official server.jar for a version
@@ -115,13 +153,26 @@ pub enum AccountAction {
 pub struct ProfileOverrides {
     // These are optional so `run` can temporarily override a saved profile.
     // `profile create` and `profile edit` persist the same values instead.
-    #[arg(long, help = "Minecraft version (e.g., 1.20.4)")]
+    #[arg(long, help = "Minecraft version (e.g., 1.21.1, latest, snapshot)")]
     pub version: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        help = "Mod loader to install/use (fabric, quilt, forge, neoforge, vanilla)"
+    )]
+    pub loader: Option<Loader>,
+    #[arg(
+        long,
+        help = "Mod loader version (default: installed one, else recommended/latest stable)"
+    )]
+    pub loader_version: Option<String>,
     #[arg(long, help = "Custom game directory path")]
     pub game_dir: Option<String>,
-    #[arg(long, help = "Shortcut to set RAM in JVM args (e.g., 4G)")]
-    pub ram: Option<String>,
-    #[arg(long, help = "Full custom JVM arguments string")]
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        help = "Full JVM arguments string, e.g. \"-Xmx4G -XX:+UseG1GC\" (replaces the defaults)"
+    )]
     pub jvm_args: Option<String>,
     #[arg(long, help = "Path to custom Java executable (or 'bundled')")]
     pub java_bin: Option<String>,
@@ -129,10 +180,14 @@ pub struct ProfileOverrides {
     pub width: Option<String>,
     #[arg(long, help = "Window height (or 'auto')")]
     pub height: Option<String>,
-    #[arg(long, help = "Launch in fullscreen mode")]
+    #[arg(
+        long,
+        overrides_with = "no_fullscreen",
+        help = "Launch in fullscreen mode"
+    )]
     pub fullscreen: bool,
-    #[arg(long, help = "Skip asset verification for faster launch")]
-    pub fast: bool,
+    #[arg(long, overrides_with = "fullscreen", help = "Disable fullscreen mode")]
+    pub no_fullscreen: bool,
     #[arg(long, help = "Account username to use")]
     pub account: Option<String>,
     #[arg(long, help = "Offline username override")]

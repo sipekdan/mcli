@@ -53,10 +53,28 @@ pub const CLASSPATH_SEP: &str = ";";
 #[cfg(target_os = "windows")]
 pub const NATIVE_EXTS: &[&str] = &[".dll"];
 
-#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
+#[cfg(target_arch = "aarch64")]
 pub const ADOPTIUM_ARCH: &str = "aarch64";
-#[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
+#[cfg(target_arch = "arm")]
+pub const ADOPTIUM_ARCH: &str = "arm";
+#[cfg(target_arch = "x86")]
+pub const ADOPTIUM_ARCH: &str = "x32";
+#[cfg(not(any(target_arch = "aarch64", target_arch = "arm", target_arch = "x86")))]
 pub const ADOPTIUM_ARCH: &str = "x64";
+
+/// Architecture name as Mojang's `os.arch` rules spell it (only `x86` occurs
+/// in official metadata, meaning a 32-bit x86 JVM).
+#[cfg(target_arch = "x86")]
+pub const MOJANG_ARCH: &str = "x86";
+#[cfg(target_arch = "x86_64")]
+pub const MOJANG_ARCH: &str = "x86_64";
+#[cfg(target_arch = "aarch64")]
+pub const MOJANG_ARCH: &str = "arm64";
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+pub const MOJANG_ARCH: &str = "unknown";
+
+pub const LAUNCHER_NAME: &str = "mcli";
+pub const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const MANIFEST_URL: &str = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json";
 // Preserve the application identity used by existing installations and tokens.
@@ -88,7 +106,12 @@ pub struct Paths {
     pub assets: PathBuf,
     pub profiles: PathBuf,
     pub java: PathBuf,
+    pub cache: PathBuf,
     pub profiles_file: PathBuf,
+    /// Profiles were stored here before 1.1. Mod-loader installers expect this
+    /// name to hold an *official launcher* profile file, so mcli now only
+    /// reads it once for migration and otherwise leaves the name free.
+    pub legacy_profiles_file: PathBuf,
     pub auth_file: PathBuf,
 }
 
@@ -105,7 +128,9 @@ impl Paths {
             assets: base.join("assets"),
             profiles: base.join("profiles"),
             java: base.join("runtimes"),
-            profiles_file: base.join("launcher_profiles.json"),
+            cache: base.join("cache"),
+            profiles_file: base.join("profiles.json"),
+            legacy_profiles_file: base.join("launcher_profiles.json"),
             auth_file: base.join("auth.json"),
             base,
         }
