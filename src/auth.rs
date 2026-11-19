@@ -54,6 +54,12 @@ pub fn save_auth_store(paths: &Paths, store: &AuthStore) -> Result<()> {
         fs::create_dir_all(p)?;
     }
     fs::write(&paths.auth_file, serde_json::to_string_pretty(store)?)?;
+    // The file holds access and refresh tokens; keep it private to the user.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&paths.auth_file, fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
@@ -283,7 +289,8 @@ pub async fn handle_account_cmd(
             if store.accounts.is_empty() {
                 println!("No accounts logged in. (Offline Mode)");
             }
-            for (name, data) in &store.accounts {
+            let sorted: std::collections::BTreeMap<_, _> = store.accounts.iter().collect();
+            for (name, data) in sorted {
                 let active = if store.active_account.as_deref() == Some(name) {
                     "[ACTIVE]"
                 } else {
