@@ -1,7 +1,7 @@
 //! Java runtime discovery and portable Adoptium runtime installation.
 
 use crate::config::{Paths, Result, ADOPTIUM_ARCH, ADOPTIUM_OS};
-use crate::http::{download_file, extract_zip};
+use crate::http::{download_verified, extract_zip, file_sha256, get_json};
 use reqwest::Client;
 use serde_json::Value;
 use std::fs;
@@ -60,13 +60,63 @@ pub async fn ensure_java(
     fs::create_dir_all(&java_dir)?;
 
     let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
-    let url = format!(
-        "https://api.adoptium.net/v3/binary/latest/{}/ga/{}/{}/jre/hotspot/normal/eclipse",
-        major, ADOPTIUM_OS, ADOPTIUM_ARCH
-    );
     let archive_path = java_dir.join(format!("jre{}.{}", major, ext));
 
-    download_file(client, &url, &archive_path, false).await?;
+    // Adoptium does not publish every combination: there is no Java 16 JRE
+    // (Minecraft 1.17) and no Java 8 build for Apple Silicon. Fall back to a
+    // JDK, then to x64 (which macOS runs through Rosetta).
+    let mut candidates = vec![(ADOPTIUM_ARCH, "jre"), (ADOPTIUM_ARCH, "jdk")];
+    if cfg!(target_os = "macos") && ADOPTIUM_ARCH == "aarch64" {
+        candidates.extend([("x64", "jre"), ("x64", "jdk")]);
+    }
+    let mut chosen = None;
+    let mut last_error: Option<String> = None;
+    for (arch, image) in candidates {
+        let url = format!(
+            "https://api.adoptium.net/v3/assets/latest/{major}/hotspot?architecture={arch}&image_type={image}&os={ADOPTIUM_OS}&vendor=eclipse"
+        );
+        match get_json(client, &url, None).await {
+            // An empty list means Adoptium has no such build.
+            Ok(list) => {
+                if let Some(package) = list[0]["binary"].get("package") {
+                    chosen = Some(package.clone());
+                    break;
+                }
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    let Some(package) = chosen else {
+        return Err(format!(
+            "No Java {major} runtime available from Adoptium for {ADOPTIUM_OS}/{ADOPTIUM_ARCH}{}. \
+             Install one yourself and pass --java-bin /path/to/java.",
+            last_error.map(|e| format!(" ({e})")).unwrap_or_default()
+        )
+        .into());
+    };
+    let link = package["link"]
+        .as_str()
+        .ok_or("Adoptium package has no link")?;
+    download_verified(
+        client,
+        link,
+        &archive_path,
+        None,
+        package["size"].as_u64(),
+        false,
+    )
+    .await?;
+    // Adoptium publishes a SHA-256 for every package.
+    if let Some(expected) = package["checksum"].as_str() {
+        let actual = file_sha256(&archive_path)?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            let _ = fs::remove_file(&archive_path);
+            return Err(format!(
+                "Java {major} download is corrupt (SHA-256 {actual}, expected {expected}). Try again."
+            )
+            .into());
+        }
+    }
     println!("Extracting Java {}...", major);
 
     if cfg!(windows) {
