@@ -78,6 +78,7 @@ to fetch the newest one.
 mcli profile list
 mcli profile create Survival --version 1.21.1 --jvm-args "-Xms4G -Xmx4G -XX:+UseG1GC"
 mcli profile edit Survival --fullscreen
+mcli profile rename Survival Hardcore   # also moves profiles/Survival -> profiles/Hardcore
 mcli profile remove Survival --purge
 
 # Versions (`latest` and `snapshot` follow Mojang's manifest)

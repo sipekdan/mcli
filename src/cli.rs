@@ -84,7 +84,7 @@ pub enum ProfileAction {
         #[command(flatten)]
         overrides: ProfileOverrides,
     },
-    /// Rename a profile
+    /// Rename a profile (its managed game directory moves too; don't rename a running profile)
     Rename { name: String, new_name: String },
     /// Remove a profile (pass --purge to also delete saves/files)
     Remove {

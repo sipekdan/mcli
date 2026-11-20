@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -219,6 +219,50 @@ pub async fn apply_loader(
     Ok(())
 }
 
+/// When a renamed profile uses its managed directory (`<root>/<old>`), move
+/// that directory to `<root>/<new>` and point the profile at it. Custom game
+/// directories are left alone. Returns `(from, to)` if files were moved.
+fn move_managed_dir(
+    root: &Path,
+    old: &str,
+    new: &str,
+    prof: &mut Profile,
+    others: &HashMap<String, Profile>,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    let old_dir = root.join(old);
+    if Path::new(&prof.game_dir) != old_dir {
+        return Ok(None);
+    }
+    let new_dir = root.join(new);
+    for (other, p) in others {
+        let dir = Path::new(&p.game_dir);
+        if dir == old_dir {
+            return Err(format!(
+                "Profile '{other}' also uses {}; not moving it",
+                old_dir.display()
+            )
+            .into());
+        }
+        if dir == new_dir {
+            return Err(format!("Profile '{other}' already uses {}", new_dir.display()).into());
+        }
+    }
+    if new_dir.exists() {
+        return Err(format!(
+            "{} already exists. Move or remove it first.",
+            new_dir.display()
+        )
+        .into());
+    }
+    prof.game_dir = new_dir.to_string_lossy().to_string();
+    if !old_dir.exists() {
+        // Never launched: nothing on disk to move.
+        return Ok(None);
+    }
+    fs::rename(&old_dir, &new_dir)?;
+    Ok(Some((old_dir, new_dir)))
+}
+
 pub async fn handle_profile_cmd(
     action: ProfileAction,
     client: &Client,
@@ -271,10 +315,21 @@ pub async fn handle_profile_cmd(
             if profiles.contains_key(&new_name) {
                 return Err(format!("Profile '{new_name}' already exists").into());
             }
-            if let Some(prof) = profiles.remove(&name) {
+            if let Some(mut prof) = profiles.remove(&name) {
+                let moved =
+                    move_managed_dir(&paths.profiles, &name, &new_name, &mut prof, &profiles)?;
                 profiles.insert(new_name.clone(), prof);
-                save_profiles(paths, &profiles)?;
+                if let Err(error) = save_profiles(paths, &profiles) {
+                    // Keep files and configuration in agreement.
+                    if let Some((from, to)) = &moved {
+                        let _ = fs::rename(to, from);
+                    }
+                    return Err(error);
+                }
                 println!("[+] Renamed profile '{}' -> '{}'.", name, new_name);
+                if let Some((_, to)) = moved {
+                    println!("[+] Moved game directory to {}", to.display());
+                }
             } else {
                 println!("[!] Profile '{}' does not exist.", name);
             }
@@ -321,4 +376,81 @@ pub async fn handle_profile_cmd(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{move_managed_dir, Profile};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("mcli-rename-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn managed(root: &std::path::Path, name: &str) -> Profile {
+        Profile {
+            game_dir: root.join(name).to_string_lossy().to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn moves_managed_directory() {
+        let root = temp_root("move");
+        fs::create_dir_all(root.join("Old/mods")).unwrap();
+        let mut prof = managed(&root, "Old");
+        let moved = move_managed_dir(&root, "Old", "New", &mut prof, &HashMap::new()).unwrap();
+        assert_eq!(moved, Some((root.join("Old"), root.join("New"))));
+        assert!(root.join("New/mods").is_dir() && !root.join("Old").exists());
+        assert_eq!(PathBuf::from(&prof.game_dir), root.join("New"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn updates_path_of_never_launched_profile() {
+        let root = temp_root("unlaunched");
+        let mut prof = managed(&root, "Old");
+        assert_eq!(
+            move_managed_dir(&root, "Old", "New", &mut prof, &HashMap::new()).unwrap(),
+            None
+        );
+        assert_eq!(PathBuf::from(&prof.game_dir), root.join("New"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn leaves_custom_directory_alone() {
+        let root = temp_root("custom");
+        let mut prof = Profile {
+            game_dir: "/somewhere/else".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            move_managed_dir(&root, "Old", "New", &mut prof, &HashMap::new()).unwrap(),
+            None
+        );
+        assert_eq!(prof.game_dir, "/somewhere/else");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refuses_existing_target_or_shared_directory() {
+        let root = temp_root("refuse");
+        fs::create_dir_all(root.join("Old")).unwrap();
+        fs::create_dir_all(root.join("New")).unwrap();
+        let mut prof = managed(&root, "Old");
+        assert!(move_managed_dir(&root, "Old", "New", &mut prof, &HashMap::new()).is_err());
+        assert_eq!(PathBuf::from(&prof.game_dir), root.join("Old"));
+
+        fs::remove_dir(root.join("New")).unwrap();
+        let others = HashMap::from([("Twin".to_string(), managed(&root, "Old"))]);
+        assert!(move_managed_dir(&root, "Old", "New", &mut prof, &others).is_err());
+        assert!(root.join("Old").is_dir() && !root.join("New").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
